@@ -106,8 +106,8 @@ typedef struct {
     floatX* attprojb; // (L, C)
     floatX* ln2w; // (L, C)
     floatX* ln2b; // (L, C)
-    floatX* fcw; // (L, 4*C, C)
-    floatX* fcb; // (L, 4*C)
+    floatX* fcw; // (L, 8*C, C)  // SwiGLU: two projections, each 4*C
+    floatX* fcb; // (L, 8*C)     // SwiGLU: two projections, each 4*C
     floatX* fcprojw; // (L, C, 4*C)
     floatX* fcprojb; // (L, C)
     floatX* lnfw; // (C)
@@ -130,8 +130,8 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     param_sizes[7] = L * C; // attprojb
     param_sizes[8] = L * C; // ln2w
     param_sizes[9] = L * C; // ln2b
-    param_sizes[10] = L * (4 * C) * C; // fcw
-    param_sizes[11] = L * (4 * C); // fcb
+    param_sizes[10] = config.num_layers * (8 * config.channels) * config.channels; // fcw: (L, 8*C, C)
+    param_sizes[11] = config.num_layers * (8 * config.channels); // fcb: (L, 8*C)
     param_sizes[12] = L * C * (4 * C); // fcprojw
     param_sizes[13] = L * C; // fcprojb
     param_sizes[14] = C; // lnfw
@@ -185,8 +185,8 @@ typedef struct {
     floatX* ln2; // (L, B, T, C)
     float* ln2_mean; // (L, B, T)
     float* ln2_rstd; // (L, B, T)
-    floatX* fch; // (L, B, T, 4*C)
-    floatX* fch_gelu; // (L, B, T, 4*C)
+    floatX* fch; // (L, B, T, 8*C) // SwiGLU: two projections, each 4*C
+    floatX* fch_swiglu; // (L, B, T, 4*C) // SwiGLU output
     floatX* residual3; // (L, B, T, C)
     floatX* lnf; // (B, T, C);   if LN recomputation is enabled (-r 2 and above), will be used for _all_ layernorms
     float* lnf_mean; // (B, T)
@@ -238,9 +238,9 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[7] = TENSOR_SPEC(data->ln2, (recompute < 2) ? L * B * T * C : 0);
     tensors[8] = TENSOR_SPEC(data->ln2_mean, L * B * T);
     tensors[9] = TENSOR_SPEC(data->ln2_rstd, L * B * T);
-    tensors[10] = TENSOR_SPEC(data->fch, L * B * T * 4*C);
+    tensors[10] = TENSOR_SPEC(data->fch, L * B * T * 8*C);
     // if recompute >= 1 then we will recompute gelu_forward during backward and use this as scratch buffer
-    tensors[11] = TENSOR_SPEC(data->fch_gelu, (recompute < 1) ? L * B * T * 4*C : B * T * 4*C);
+    tensors[11] = TENSOR_SPEC(data->fch_swiglu, (recompute < 1) ? L * B * T * 4*C : B * T * 4*C);
     tensors[12] = TENSOR_SPEC(data->residual3, L * B * T * C);
     tensors[13] = TENSOR_SPEC(data->lnf, B * T * C);
     tensors[14] = TENSOR_SPEC(data->lnf_mean, B * T);
@@ -694,8 +694,8 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         floatX* l_attprojb = params.attprojb + l * C;
         floatX* l_ln2w = params.ln2w + l * C;
         floatX* l_ln2b = params.ln2b + l * C;
-        floatX* l_fcw = params.fcw + l * 4*C * C;
-        floatX* l_fcb = params.fcb + l * 4*C;
+        floatX* l_fcw = params.fcw + l * 8*C * C; // SwiGLU: (8*C, C)
+        floatX* l_fcb = params.fcb + l * 8*C;     // SwiGLU: (8*C)
         floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
         floatX* l_fcprojb = params.fcprojb + l * C;
 
@@ -707,10 +707,10 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
         float* l_ln2_mean = acts.ln2_mean + l * B * T;
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        floatX* l_fch = acts.fch + l * B * T * 4*C;
+        floatX* l_fch = acts.fch + l * B * T * 8*C; // SwiGLU: (B, T, 8*C)
+        floatX* l_fch_swiglu = acts.fch_swiglu + l * B * T * 4*C; // SwiGLU output
         // reuse the same activation buffer at each layer, as we'll re-compute the gelu during backward
         // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
-        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
         floatX* l_residual3 = acts.residual3 + l * B * T * C;
         floatX* scratch = (floatX*)acts.output; // used for non-cudnn attention, fcproj, attproj, etc.
 
@@ -732,8 +732,10 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
-        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
-        matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
+        // SwiGLU: matmul to get (B, T, 8*C), then apply SwiGLU activation
+        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 8*C, main_stream);
+        swiglu_forward(l_fch_swiglu, l_fch, B * T, C, main_stream); // custom kernel: output (B, T, 4*C)
+        matmul_forward_cublaslt(scratch, l_fch_swiglu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
         // OK, fusion across blocks.
         if(l+1 != L) {
             floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
@@ -858,7 +860,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         floatX* l_attprojw = params.attprojw + l * C * C;
         floatX* l_ln2w = params.ln2w + l * C;
         floatX* l_ln2b = params.ln2b + l * C;
-        floatX* l_fcw = params.fcw + l * 4*C * C;
+        floatX* l_fcw = params.fcw + l * 8*C * C;
         floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
         // get the pointers of the gradients of the weights for this layer
         floatX* dl_ln1w = grads.ln1w + l * C;
@@ -869,8 +871,8 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         floatX* dl_attprojb = grads.attprojb + l * C;
         floatX* dl_ln2w = grads.ln2w + l * C;
         floatX* dl_ln2b = grads.ln2b + l * C;
-        floatX* dl_fcw = grads.fcw + l * 4*C * C;
-        floatX* dl_fcb = grads.fcb + l * 4*C;
+        floatX* dl_fcw = grads.fcw + l * 8*C * C;
+        floatX* dl_fcb = grads.fcb + l * 8*C;
         floatX* dl_fcprojw = grads.fcprojw + l * C * 4*C;
         floatX* dl_fcprojb = grads.fcprojb + l * C;
         // get the pointers of the activations for this layer
@@ -883,8 +885,8 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
         float* l_ln2_mean = acts.ln2_mean + l * B * T;
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        floatX* l_fch_pre_gelu = acts.fch + l * B * T * 4*C;
-        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
+        floatX* l_fch = acts.fch + l * B * T * 8*C;
+        floatX* l_fch_swiglu = acts.fch_swiglu + l * B * T * 4*C;
         // get the pointers of the gradients of the activations for this layer
         // notice that there is no l *, because we just have a single copy, and keep
         // re-using this memory in every Transformer block as we calculate backward pass
@@ -897,12 +899,11 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
             // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
             gelu_forward(l_fch_gelu, l_fch_pre_gelu, B*T*4*C, main_stream);
         }
-        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream, l_fch_pre_gelu, model->gelu_fusion);
-        if(model->recompute >= 2) {
-            // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
-            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
-        }
-        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream);
+        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_swiglu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream);
+
+        swiglu_backward(dl_bt4c, l_fch, l_fch_swiglu, B * T, C, main_stream); // custom kernel: dl_bt4c is grad wrt l_fch
+
+        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 8 * C, main_stream);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
         layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, main_stream);
         matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, scratchF, B, T, C, C, main_stream);
@@ -1132,6 +1133,7 @@ float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
     including LayerNorm params, biases, and the position embedding weights,
     but these are very small terms. Also keep in mind that we would want to exclude
     the token embedding weights, but in GPT-2 these are weight shared, so they
+   
     participate in the classifier matmul, so they are correct to be included in N.
     Note 2: The first term (6 * N) in flops_per_token is all weight matmuls, the
     second is the attention matmul, which is also usually a small contribution.
