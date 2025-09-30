@@ -839,7 +839,6 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     // this was done in the fused classifier kernel as last step of forward pass
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
-    next: backward the classifier matmul
     matmul_backward(model->acts.scratch_bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
     // backward the final layernorm
     floatX* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
@@ -1906,4 +1905,5 @@ int main(int argc, char *argv[]) {
     common_free(model);
     return 0;
 }
+#endif
 #endif
