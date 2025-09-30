@@ -49,6 +49,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/layernorm.cuh"
 // defines: matmul_cublaslt, matmul_forward, matmul_backward, gelu_forward, gelu_backward_inplace
 #include "llmc/matmul.cuh"
+// Add SwiGLU CUDA kernel header
+#include "llmc/swiglu.cuh"
 #ifdef ENABLE_CUDNN
 // defines: create_cudnn, destroy_cudnn, attention_forward_cudnn, attention_backward_cudnn
 #include "llmc/cudnn_att.h"
@@ -837,7 +839,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     // this was done in the fused classifier kernel as last step of forward pass
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
-    // next: backward the classifier matmul
+    next: backward the classifier matmul
     matmul_backward(model->acts.scratch_bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
     // backward the final layernorm
     floatX* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
@@ -897,7 +899,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         if(model->recompute >= 1) {
             // recompute >= 1 means we recompute gelu. in this case,
             // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
-            gelu_forward(l_fch_gelu, l_fch_pre_gelu, B*T*4*C, main_stream);
+            //gelu_forward(l_fch_gelu, l_fch, B*T*4*C, main_stream);
         }
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_swiglu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream);
 
@@ -915,7 +917,8 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         floatX* l_att = acts.att + l * B * NH * T * T;
         // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
         floatX* buffer_a = l_atty;
-        floatX* buffer_b = l_fch_pre_gelu;        // this is B x T x 4C, so even larger than what we need
+        // Remove reference to l_fch_pre_gelu, just reuse l_fch or buffer_a as needed
+        floatX* buffer_b = l_fch; // (B, T, 8*C) is available, but only (B, T, 4*C) needed for attention_backward
         attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
         #endif
         if(model->recompute >= 2) {
