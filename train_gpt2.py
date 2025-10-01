@@ -845,6 +845,15 @@ if __name__ == "__main__":
             with open(logfile, "a") as f:
                 f.write("s:%d trl:%f\n" % (step, lossf))
 
+        # Save model every 5 epochs/steps (excluding step 0)
+        if master_process and step > 0 and step % 5 == 0:
+            model_to_size = {"gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
+            model_to_size.update({f"d{d}": f"d{d}" for d in [12, 24, 36, 48]})
+            model_size_str = model_to_size[args.model]
+            model_save_path = os.path.join(saved_models_dir, f"gpt2_{model_size_str}_step{step}.bin")
+            write_model(raw_model, model_save_path, dtype=args.dtype)
+            print0(f"Saved model at step {step} to {model_save_path}")
+
         # keep track of smooth timings, last 20 iterations
         if step > 0 and step > args.num_iterations - 20:
             timings.append(t1-t0)
