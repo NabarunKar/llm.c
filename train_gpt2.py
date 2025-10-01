@@ -860,14 +860,35 @@ if __name__ == "__main__":
             write_model(raw_model, model_save_path, dtype=args.dtype)
             print0(f"Saved model at step {step} to {model_save_path}")
 
-        # keep track of smooth timings, last 20 iterations
-        if step > 0 and step > args.num_iterations - 20:
-            timings.append(t1-t0)
-
     # print the average of the last 20 timings, to get something smooth-ish
     timings = timings[-20:]
     print0(f"final {len(timings)} iters avg: {np.mean(timings)*1000:.3f}ms")
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+
+    # -------------------------------------------------------------------------
+    # Save the model from the last epoch/step always
+    if master_process:
+        model_to_size = {"gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
+        model_to_size.update({f"d{d}": f"d{d}" for d in [12, 24, 36, 48]})
+        model_size_str = model_to_size[args.model]
+        # Save in .bin format for C
+        final_model_save_path = os.path.join(saved_models_dir, f"gpt2_{model_size_str}_final.bin")
+        write_model(raw_model, final_model_save_path, dtype=args.dtype)
+        print0(f"Saved final model to {final_model_save_path}")
+        
+        # Save in PyTorch .pt format for Python evaluation
+        pt_save_path = os.path.join(saved_models_dir, f"gpt2_{model_size_str}_final.pt")
+        torch.save(raw_model.state_dict(), pt_save_path)
+        print0(f"Saved PyTorch model to {pt_save_path}")
+
+        # Also save the periodic checkpoints in .pt format
+        for checkpoint_file in glob.glob(os.path.join(saved_models_dir, f"gpt2_{model_size_str}_step*.bin")):
+            step_num = checkpoint_file.split("step")[-1].split(".bin")[0]
+            pt_checkpoint_path = os.path.join(saved_models_dir, f"gpt2_{model_size_str}_step{step_num}.pt")
+            if not os.path.exists(pt_checkpoint_path):
+                # Only create .pt if it doesn't already exist (in case this is rerun)
+                torch.save(raw_model.state_dict(), pt_checkpoint_path)
+                print0(f"Saved checkpoint PyTorch model to {pt_checkpoint_path}")
 
     # -------------------------------------------------------------------------
     # clean up nice
