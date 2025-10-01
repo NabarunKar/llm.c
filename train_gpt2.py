@@ -736,6 +736,12 @@ if __name__ == "__main__":
         with open(logfile, "w") as f:
             pass
 
+    # create directory for saving models
+    saved_models_dir = "/content/saved_models"
+    if master_process:
+        os.makedirs(saved_models_dir, exist_ok=True)
+        print0(f"Models will be saved to {saved_models_dir}")
+
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     timings = []
