@@ -45,8 +45,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 // ----------- Layer implementations in CUDA -----------
 // defines: encoder_forward, encoder_backward
 #include "llmc/encoder.cuh"
-// defines: layernorm_forward, residual_forward, fused_residual_forward5, layernorm_backward
-#include "llmc/layernorm.cuh"
+// defines: rmsnorm_forward, residual_forward, fused_residual_rmsnorm_forward, rmsnorm_backward
+#include "llmc/rmsnorm.cuh"
 // defines: matmul_cublaslt, matmul_forward, matmul_backward, gelu_forward, gelu_backward_inplace
 #include "llmc/matmul.cuh"
 #ifdef ENABLE_CUDNN
@@ -99,21 +99,21 @@ typedef struct {
     floatX* wte; // (V, C)
     floatX* wpe; // (maxT, C)
     floatX* ln1w; // (L, C)
-    floatX* ln1b; // (L, C)
+    // Removed ln1b
     floatX* qkvw; // (L, 3*C, C)
     floatX* qkvb; // (L, 3*C)
     floatX* attprojw; // (L, C, C)
     floatX* attprojb; // (L, C)
     floatX* ln2w; // (L, C)
-    floatX* ln2b; // (L, C)
+    // Removed ln2b
     floatX* fcw; // (L, 4*C, C)
     floatX* fcb; // (L, 4*C)
     floatX* fcprojw; // (L, C, 4*C)
     floatX* fcprojb; // (L, C)
     floatX* lnfw; // (C)
-    floatX* lnfb; // (C)
+    // Removed lnfb
 } ParameterTensors;
-static_assert(sizeof(ParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*), "Inconsistent sizes!");
+static_assert(sizeof(ParameterTensors) == (NUM_PARAMETER_TENSORS-3) * sizeof(void*), "Inconsistent sizes!");
 
 void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Config config) {
     size_t Vp = config.padded_vocab_size;
@@ -123,22 +123,22 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     param_sizes[0] = Vp * C; // wte
     param_sizes[1] = maxT * C; // wpe
     param_sizes[2] = L * C; // ln1w
-    param_sizes[3] = L * C; // ln1b
-    param_sizes[4] = L * (3 * C) * C; // qkvw
-    param_sizes[5] = L * (3 * C); // qkvb
-    param_sizes[6] = L * C * C; // attprojw
-    param_sizes[7] = L * C; // attprojb
-    param_sizes[8] = L * C; // ln2w
-    param_sizes[9] = L * C; // ln2b
-    param_sizes[10] = L * (4 * C) * C; // fcw
-    param_sizes[11] = L * (4 * C); // fcb
-    param_sizes[12] = L * C * (4 * C); // fcprojw
-    param_sizes[13] = L * C; // fcprojb
-    param_sizes[14] = C; // lnfw
-    param_sizes[15] = C; // lnfb
+    // Removed ln1b
+    param_sizes[3] = L * (3 * C) * C; // qkvw
+    param_sizes[4] = L * (3 * C); // qkvb
+    param_sizes[5] = L * C * C; // attprojw
+    param_sizes[6] = L * C; // attprojb
+    param_sizes[7] = L * C; // ln2w
+    // Removed ln2b
+    param_sizes[8] = L * (4 * C) * C; // fcw
+    param_sizes[9] = L * (4 * C); // fcb
+    param_sizes[10] = L * C * (4 * C); // fcprojw
+    param_sizes[11] = L * C; // fcprojb
+    param_sizes[12] = C; // lnfw
+    // Removed lnfb
 
     // populate the parameter sizes in bytes (all the same for now, keeping for future use)
-    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+    for (int i = 0; i < NUM_PARAMETER_TENSORS-3; i++) {
         param_sizeof[i] = sizeof(floatX);
     }
 }
@@ -147,7 +147,7 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
 void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elements, size_t *param_sizeof) {
     // calculate the total number of parameters and bytes across all tensors
     size_t num_parameters_bytes = 0;
-    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+    for (int i = 0; i < NUM_PARAMETER_TENSORS-3; i++) {
         num_parameters_bytes += param_elements[i] * param_sizeof[i];
     }
     // malloc all parameters all at once on the device
@@ -155,12 +155,12 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
     cudaCheck(cudaMalloc((void**)&params_memory, num_parameters_bytes));
     // assign all the tensors their place in the array
     floatX** ptrs[] = {
-        &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
-        &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
-        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
+        &params->wte, &params->wpe, &params->ln1w, &params->qkvw, &params->qkvb,
+        &params->attprojw, &params->attprojb, &params->ln2w, &params->fcw, &params->fcb,
+        &params->fcprojw, &params->fcprojb, &params->lnfw
     };
     char* params_memory_iterator = (char*)params_memory;
-    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+    for (int i = 0; i < NUM_PARAMETER_TENSORS-3; i++) {
         *(ptrs[i]) = (floatX*)params_memory_iterator;
         params_memory_iterator += param_elements[i] * param_sizeof[i];
     }
@@ -171,7 +171,7 @@ constexpr int NUM_ACTIVATION_TENSORS = 21;
 typedef struct {
     floatX* encoded; // (B, T, C)
     floatX* ln1; // (L, B, T, C)
-    float* ln1_mean; // (L, B, T)
+    // Removed ln1_mean
     float* ln1_rstd; // (L, B, T)
     floatX* atty; // (L, B, T, C)
     // cuDNN saves only some statistics information
@@ -183,13 +183,13 @@ typedef struct {
 
     floatX* residual2; // (L, B, T, C)
     floatX* ln2; // (L, B, T, C)
-    float* ln2_mean; // (L, B, T)
+    // Removed ln2_mean
     float* ln2_rstd; // (L, B, T)
     floatX* fch; // (L, B, T, 4*C)
     floatX* fch_gelu; // (L, B, T, 4*C)
     floatX* residual3; // (L, B, T, C)
     floatX* lnf; // (B, T, C);   if LN recomputation is enabled (-r 2 and above), will be used for _all_ layernorms
-    float* lnf_mean; // (B, T)
+    // Removed lnf_mean
     float* lnf_rstd; // (B, T)
     float* losses; // (B, T), will be accumulated in micro-steps
     // adding these two compared to the CPU .c code, needed for attention kernel as buffers
@@ -216,7 +216,7 @@ struct TensorSpec {
 
 #define TENSOR_SPEC(pointer, size) TensorSpec{(void**)(&pointer), (size), dtype_of(pointer)};
 
-void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS], size_t B, size_t T, GPT2Config config, int recompute) {
+void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS-3], size_t B, size_t T, GPT2Config config, int recompute) {
     size_t Vp = config.padded_vocab_size;
     size_t L = config.num_layers;
     size_t NH = config.num_heads;
@@ -224,38 +224,38 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[0] = TENSOR_SPEC(data->encoded, B * T * C);
     // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
     tensors[1] = TENSOR_SPEC(data->ln1,  (recompute < 2) ? L * B * T * C : 0);
-    tensors[2] = TENSOR_SPEC(data->ln1_mean, L * B * T);
-    tensors[3] = TENSOR_SPEC(data->ln1_rstd, L * B * T);
-    tensors[4] = TENSOR_SPEC(data->atty, L * B * T * C);
+    // Removed ln1_mean
+    tensors[2] = TENSOR_SPEC(data->ln1_rstd, L * B * T);
+    tensors[3] = TENSOR_SPEC(data->atty, L * B * T * C);
     #ifdef ENABLE_CUDNN
     // FP32 stats tensor for cuDNN to be passed to backward pass
-    tensors[5] = TENSOR_SPEC(data->att, L * B * NH * T);
+    tensors[4] = TENSOR_SPEC(data->att, L * B * NH * T);
     #else
-    tensors[5] = TENSOR_SPEC(data->att, L * B * NH * T * T);
+    tensors[4] = TENSOR_SPEC(data->att, L * B * NH * T * T);
     #endif
-    tensors[6] = TENSOR_SPEC(data->residual2, L * B * T * C);
+    tensors[5] = TENSOR_SPEC(data->residual2, L * B * T * C);
     // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
-    tensors[7] = TENSOR_SPEC(data->ln2, (recompute < 2) ? L * B * T * C : 0);
-    tensors[8] = TENSOR_SPEC(data->ln2_mean, L * B * T);
-    tensors[9] = TENSOR_SPEC(data->ln2_rstd, L * B * T);
-    tensors[10] = TENSOR_SPEC(data->fch, L * B * T * 4*C);
+    tensors[6] = TENSOR_SPEC(data->ln2, (recompute < 2) ? L * B * T * C : 0);
+    // Removed ln2_mean
+    tensors[7] = TENSOR_SPEC(data->ln2_rstd, L * B * T);
+    tensors[8] = TENSOR_SPEC(data->fch, L * B * T * 4*C);
     // if recompute >= 1 then we will recompute gelu_forward during backward and use this as scratch buffer
-    tensors[11] = TENSOR_SPEC(data->fch_gelu, (recompute < 1) ? L * B * T * 4*C : B * T * 4*C);
-    tensors[12] = TENSOR_SPEC(data->residual3, L * B * T * C);
-    tensors[13] = TENSOR_SPEC(data->lnf, B * T * C);
-    tensors[14] = TENSOR_SPEC(data->lnf_mean, B * T);
-    tensors[15] = TENSOR_SPEC(data->lnf_rstd, B * T);
-    tensors[16] = TENSOR_SPEC(data->losses, B * T);
-    tensors[17] = TENSOR_SPEC(data->qkvr, L * B * T * 3*C);
-    tensors[18] = TENSOR_SPEC(data->output, B * T * max(3*C, max(NH*T, Vp)));
-
-    tensors[19] = TENSOR_SPEC(data->scratch_bt4c, B * T * 4 * C);
-    tensors[20] = TENSOR_SPEC(data->scratch_btc, B * T * C);
+    tensors[9] = TENSOR_SPEC(data->fch_gelu, (recompute < 1) ? L * B * T * 4*C : B * T * 4*C);
+    tensors[10] = TENSOR_SPEC(data->residual3, L * B * T * C);
+    tensors[11] = TENSOR_SPEC(data->lnf, B * T * C);
+    // Removed lnf_mean
+    tensors[12] = TENSOR_SPEC(data->lnf_rstd, B * T);
+    tensors[13] = TENSOR_SPEC(data->losses, B * T);
+    tensors[14] = TENSOR_SPEC(data->qkvr, L * B * T * 3*C);
+    tensors[15] = TENSOR_SPEC(data->output, B * T * max(3*C, max(NH*T, Vp)));
+    
+    tensors[16] = TENSOR_SPEC(data->scratch_bt4c, B * T * 4 * C);
+    tensors[17] = TENSOR_SPEC(data->scratch_btc, B * T * C);
 }
 
-void* malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]) {
+void* malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS-3]) {
     size_t bytes = 0;
-    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS-3; i++) {
         bytes += tensors[i].size * sizeof_dtype(tensors[i].type);
     }
 
@@ -270,7 +270,7 @@ void* malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]
     cudaCheck(cudaMemset(acts_memory, 0, bytes));
 
     char* acts_memory_iterator = (char*)acts_memory;
-    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS-3; i++) {
         // extra protection so we don't accidentally use an empty buffer
         if(tensors[i].size == 0) {
             *(tensors[i].ptr) = NULL;
@@ -599,23 +599,23 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     size_t offset = 0;
     for (int l = 0; l < L; l++) {
         offset = 0;
-        for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-            // the layernorm parameters are all initialized to 1
-            if (l == 0 && (i == 2 || i == 8 || i == 14)) { // only at l = 0 to init these just once
+        for (int i = 0; i < NUM_PARAMETER_TENSORS-3; i++) {
+            // For RMSNorm, initialize all weight parameters to 1.0
+            if (l == 0 && (i == 2 || i == 7 || i == 12)) { // only at l = 0 to init these just once
                 for (size_t j = 0; j < model->param_elements[i]; j++) {
                     params_memory_cpu[offset + j] = 1.0f;
                 }
             }
             // weights tensors are handled here
             if ((l == 0 && (i == 0 || i == 1)) // only at l = 0, init the wte and wpe tensors
-              || i == 4 || i == 6 || i == 10 || i == 12) {
+              || i == 3 || i == 5 || i == 8 || i == 10) {
                 size_t n = model->param_elements[i];
                 size_t layer_offset = 0;
                 if (i == 0) {
                     // for wte tensor (padded vocab) override to init V instead of Vp rows
                     n = model->config.vocab_size * model->config.channels;
                 }
-                if (i == 4 || i == 6 || i == 10 || i == 12) {
+                if (i == 3 || i == 5 || i == 8 || i == 10) {
                     // weight tensors, we are only initializing layer l
                     assert(n % L == 0);
                     n = n / L;
@@ -623,7 +623,7 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
                 }
                 // in GPT-2, the projections back into the residual stream are additionally
                 // scaled by 1/sqrt(2*L) for training stability
-                float scale = (i == 6 || i == 12) ? 0.02f * residual_scale : 0.02f;
+                float scale = (i == 5 || i == 10) ? 0.02f * residual_scale : 0.02f;
                 // okay let's draw the random numbers and write them
                 float *fp32_buffer = (float*)mallocCheck(n * sizeof(float));
                 normal_(fp32_buffer, n, 0.0f, scale, &init_rng);
@@ -679,8 +679,8 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     ActivationTensors acts = model->acts;
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
 
-    // first layernorm isn't fused
-    layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
+    // First layernorm isn't fused
+    rmsnorm_forward(acts.ln1, acts.ln1_rstd, acts.encoded, params.ln1w, B, T, C, main_stream);
 
     for (int l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
@@ -688,12 +688,12 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         floatX* residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
         // get the pointers of the weights for this layer
+        floatX* l_ln1w = params.ln1w + l * C;
         floatX* l_qkvw = params.qkvw + l * 3*C * C;
         floatX* l_qkvb = params.qkvb + l * 3*C;
         floatX* l_attprojw = params.attprojw + l * C * C;
         floatX* l_attprojb = params.attprojb + l * C;
         floatX* l_ln2w = params.ln2w + l * C;
-        floatX* l_ln2b = params.ln2b + l * C;
         floatX* l_fcw = params.fcw + l * 4*C * C;
         floatX* l_fcb = params.fcb + l * 4*C;
         floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
@@ -705,7 +705,6 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
         floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
-        float* l_ln2_mean = acts.ln2_mean + l * B * T;
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch = acts.fch + l * B * T * 4*C;
         // reuse the same activation buffer at each layer, as we'll re-compute the gelu during backward
@@ -731,22 +730,17 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         #endif
 
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
-        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
+        fused_residual_rmsnorm_forward(l_residual2, l_ln2, l_ln2_rstd, residual, scratch, l_ln2w, B*T, C, main_stream);
         matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
         matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
         // OK, fusion across blocks.
         if(l+1 != L) {
             floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
-            float* l_ln1_mean = acts.ln1_mean + (l + 1) * B * T;
             float* l_ln1_rstd = acts.ln1_rstd + (l + 1) * B * T;
             const floatX* l_ln1w = params.ln1w + (l + 1) * C;
-            const floatX* l_ln1b = params.ln1b + (l + 1) * C;
-            fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, scratch, l_ln1w, l_ln1b,
-                                    B * T, C, main_stream);
+            fused_residual_rmsnorm_forward(l_residual3, l_ln1, l_ln1_rstd, l_residual2, scratch, l_ln1w, B * T, C, main_stream);
         } else {
-            fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, scratch,
-                                    params.lnfw, params.lnfb,
-                                    B * T, C, main_stream);
+            fused_residual_rmsnorm_forward(l_residual3, acts.lnf, acts.lnf_rstd, l_residual2, scratch, params.lnfw, B * T, C, main_stream);
         }
     }
 
@@ -835,11 +829,11 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     // this was done in the fused classifier kernel as last step of forward pass
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
-    // next: backward the classifier matmul
+    next: backward the classifier matmul
     matmul_backward(model->acts.scratch_bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
     // backward the final layernorm
     floatX* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
-    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, model->acts.scratch_bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C, main_stream);
+    rmsnorm_backward(dresidual, grads.lnfw, scratchF, model->acts.scratch_bt4c, residual, params.lnfw, acts.lnf_rstd, B, T, C, main_stream);
 
     // from this point on, we no longer need the values stored in the last residual, so we can reuse that memory as generic
     // scratch for backward computations
@@ -853,35 +847,31 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
 
         // get the pointers of the weights for this layer
         floatX* l_ln1w = params.ln1w + l * C;
-        floatX* l_ln1b = params.ln1b + l * C;
         floatX* l_qkvw = params.qkvw + l * 3*C * C;
+        floatX* l_qkvb = params.qkvb + l * 3*C;
         floatX* l_attprojw = params.attprojw + l * C * C;
+        floatX* l_attprojb = params.attprojb + l * C;
         floatX* l_ln2w = params.ln2w + l * C;
-        floatX* l_ln2b = params.ln2b + l * C;
         floatX* l_fcw = params.fcw + l * 4*C * C;
         floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
         // get the pointers of the gradients of the weights for this layer
         floatX* dl_ln1w = grads.ln1w + l * C;
-        floatX* dl_ln1b = grads.ln1b + l * C;
         floatX* dl_qkvw = grads.qkvw + l * 3*C * C;
         floatX* dl_qkvb = grads.qkvb + l * 3*C;
         floatX* dl_attprojw = grads.attprojw + l * C * C;
         floatX* dl_attprojb = grads.attprojb + l * C;
         floatX* dl_ln2w = grads.ln2w + l * C;
-        floatX* dl_ln2b = grads.ln2b + l * C;
         floatX* dl_fcw = grads.fcw + l * 4*C * C;
         floatX* dl_fcb = grads.fcb + l * 4*C;
         floatX* dl_fcprojw = grads.fcprojw + l * C * 4*C;
         floatX* dl_fcprojb = grads.fcprojb + l * C;
         // get the pointers of the activations for this layer
         floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
-        float* l_ln1_mean = acts.ln1_mean + l * B * T;
         float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
         floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
         floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
-        float* l_ln2_mean = acts.ln2_mean + l * B * T;
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch_pre_gelu = acts.fch + l * B * T * 4*C;
         floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
@@ -900,11 +890,11 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream, l_fch_pre_gelu, model->gelu_fusion);
         if(model->recompute >= 2) {
             // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
-            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
+            rmsnorm_forward(l_ln2, l_ln2_rstd, l_residual2, l_ln2w, B, T, C, main_stream);
         }
         matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream);
-        // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
-        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, main_stream);
+        // rmsnorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
+        rmsnorm_backward(dresidual, dl_ln2w, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_rstd, B, T, C, main_stream);
         matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, scratchF, B, T, C, C, main_stream);
 
         #ifdef ENABLE_CUDNN
@@ -918,25 +908,25 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
         #endif
         if(model->recompute >= 2) {
-            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, main_stream);
+            rmsnorm_forward(l_ln1, l_ln1_rstd, residual, l_ln1w, B, T, C, main_stream);
         }
         // QKV parameter gradients
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C, main_stream);
-        // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
-        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, main_stream);
+        // rmsnorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
+        rmsnorm_backward(dresidual, dl_ln1w, scratchF, dl_btc, residual, l_ln1w, l_ln1_rstd, B, T, C, main_stream);
 
         // Accumulate gradients from this layer in a background stream.
         if(last_step) {
             floatX* const pointers[] = {
-                dl_ln1w, dl_ln1b,
+                dl_ln1w, 
                 dl_qkvw, dl_qkvb,
                 dl_attprojw, dl_attprojb,
-                dl_ln2w, dl_ln2b,
+                dl_ln2w, 
                 dl_fcw, dl_fcb,
                 dl_fcprojw, dl_fcprojb
             };
             const size_t nelem[] = {
-                C, C,
+                C, 
                 3 * C * C, 3 * C,
                 C * C, C,
                 C, C,
@@ -1892,6 +1882,16 @@ int main(int argc, char *argv[]) {
     if (run_hellaswag) { evalloader_free(&eval_loader); }
     dataloader_free(&train_loader);
     dataloader_free(&val_loader);
+    tokenizer_free(&tokenizer);
+    free(cpu_logits_raw);
+    free(cpu_logits);
+    free(gen_tokens);
+    multi_gpu_config_free(&multi_gpu_config);
+    gpt2_free(&model);
+    common_free(model);
+    return 0;
+}
+#endif
     tokenizer_free(&tokenizer);
     free(cpu_logits_raw);
     free(cpu_logits);
