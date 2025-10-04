@@ -1892,13 +1892,3 @@ int main(int argc, char *argv[]) {
     return 0;
 }
 #endif
-    tokenizer_free(&tokenizer);
-    free(cpu_logits_raw);
-    free(cpu_logits);
-    free(gen_tokens);
-    multi_gpu_config_free(&multi_gpu_config);
-    gpt2_free(&model);
-    common_free(model);
-    return 0;
-}
-#endif
