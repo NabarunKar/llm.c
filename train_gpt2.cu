@@ -70,6 +70,9 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 // defines: multi_gpu_get_shard_offset, multi_gpu_async_reduce_gradient
 #include "llmc/zero.cuh"
 
+// Include the RoPE implementation
+#include "llmc/rope.cuh"
+
 // ----------------------------------------------------------------------------
 // global vars for I/O
 char filename_buffer[512];
@@ -91,6 +94,11 @@ typedef struct {
     int num_layers; // number of layers, e.g. 12
     int num_heads; // number of heads in attention, e.g. 12
     int channels; // number of channels, e.g. 768
+    
+    // RoPE configuration
+    int use_rope;    // Whether to use RoPE (0=no, 1=yes)
+    int rope_dim;    // Dimensions to apply RoPE to, default = head_size
+    float rope_base; // Base for rotary embeddings (10000.0 by default)
 } GPT2Config;
 
 // the parameters of the model

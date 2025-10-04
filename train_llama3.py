@@ -13,340 +13,340 @@ References:
 # 3) https://github.com/meta-llama/llama3/blob/11817d47e1ba7a4959b025eb1ca308572e0e3963/llama/generation.py
 
 Example launches to only benchmark the speed of bfloat16 compiled GPU training:
-TODO: add the actual commands
+python train_llama3.py # Train LLaMA3-tiny (125M) on TinyShakespeare
 """
 
-import argparse
 import os
+import sys
 import math
-import glob
-import inspect
-from contextlib import nullcontext
-from dataclasses import dataclass
-from pathlib import Path
 import time
-from typing import (
-    AbstractSet,
-    Collection,
-    Dict,
-    Iterator,
-    List,
-    Literal,
-    Optional,
-    Sequence,
-    Tuple,
-    Union,
-    cast,
-)
-
+import random
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-import torch._inductor.config as config
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
-from torch.distributed.optim import ZeroRedundancyOptimizer
-import torch.distributed as dist
+from torch.utils.data import Dataset
+from dataclasses import dataclass
+from typing import Optional, Tuple, List, Dict, Any, Union
 
-import tiktoken
-from tiktoken.load import load_tiktoken_bpe
+# ---------------------------------------------------------------------------
+# Configuration options and hyperparameters
 
-# -----------------------------------------------------------------------------
-# PyTorch nn.Module definitions for the LLaMA 3.x model
-
-# Used in Grouped Query Attention (GQA), broadcasts the key and value tensors
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
-    bs, slen, n_kv_heads, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    return (
-        x[:, :, :, None, :]
-        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
-        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
-    )
-
-# -----------------------------------------------------------------------------
-# RoPE related
-
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
-
-def apply_scaling(freqs: torch.Tensor):
-    # Values obtained from grid search
-    scale_factor = 8
-    low_freq_factor = 1
-    high_freq_factor = 4
-    old_context_len = 8192  # original llama3 length
-
-    low_freq_wavelen = old_context_len / low_freq_factor
-    high_freq_wavelen = old_context_len / high_freq_factor
-    new_freqs = []
-    for freq in freqs:
-        wavelen = 2 * math.pi / freq
-        if wavelen < high_freq_wavelen:
-            new_freqs.append(freq)
-        elif wavelen > low_freq_wavelen:
-            new_freqs.append(freq / scale_factor)
+@dataclass
+class LlamaConfig:
+    # Model architecture parameters
+    dim: int = 768  # Embedding dimension
+    n_layers: int = 12  # Number of transformer blocks
+    n_heads: int = 12  # Number of attention heads
+    n_kv_heads: Optional[int] = None  # Number of key/value heads (None = same as n_heads)
+    vocab_size: int = 50257  # Size of the vocabulary
+    hidden_dim: Optional[int] = None  # Size of the MLP hidden layer (None = 4*dim)
+    multiple_of: int = 256  # Make hidden_dim a multiple of this value
+    norm_eps: float = 1e-5  # LayerNorm epsilon
+    max_seq_len: int = 2048  # Maximum sequence length
+    dropout: float = 0.0  # Dropout rate
+    
+    # RoPE parameters
+    rope_base: float = 10000.0  # Base for rotary position embeddings
+    rope_scaling: Optional[Dict[str, Any]] = None  # Scaling factors for position embeddings
+    
+    # Training parameters
+    seed: int = 42
+    learning_rate: float = 6e-4
+    weight_decay: float = 0.1
+    beta1: float = 0.9
+    beta2: float = 0.95
+    grad_clip: float = 1.0
+    
+    def __post_init__(self):
+        if self.n_kv_heads is None:
+            self.n_kv_heads = self.n_heads
+        if self.hidden_dim is None:
+            self.hidden_dim = 4 * self.dim
+        
+        # Make hidden_dim a multiple of multiple_of
+        self.hidden_dim = ((self.hidden_dim + self.multiple_of - 1) 
+                          // self.multiple_of) * self.multiple_of
+    
+    @classmethod
+    def from_name(cls, name: str) -> "LlamaConfig":
+        """Create a configuration based on a model name."""
+        if name == "llama3-tiny":  # 125M
+            return cls(dim=768, n_layers=12, n_heads=12, n_kv_heads=12)
+        elif name == "llama3-small":  # 1.3B
+            return cls(dim=1536, n_layers=24, n_heads=12, n_kv_heads=12)
+        elif name == "llama3-medium":  # 2.7B
+            return cls(dim=2048, n_layers=32, n_heads=16, n_kv_heads=16)
+        elif name == "llama3-base":  # 8B
+            return cls(dim=4096, n_layers=32, n_heads=32, n_kv_heads=8)
+        elif name == "llama3-large":  # 70B
+            return cls(dim=8192, n_layers=80, n_heads=64, n_kv_heads=8)
         else:
-            assert low_freq_wavelen != high_freq_wavelen
-            smooth = (old_context_len / wavelen - low_freq_factor) / (
-                high_freq_factor - low_freq_factor
-            )
-            new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
-    return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
+            raise ValueError(f"Unknown model name: {name}")
+
+# ---------------------------------------------------------------------------
+# RoPE implementation
+
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
+    """
+    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
+    """
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
 
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply rotary embeddings to input tensors using the given frequency tensor.
+    
+    Args:
+        xq: Query tensor of shape (batch_size, seq_len, n_heads, head_dim)
+        xk: Key tensor of shape (batch_size, seq_len, n_kv_heads, head_dim)
+        freqs_cis: Complex tensor of shape (seq_len, head_dim/2)
+        
+    Returns:
+        Tuple of transformed query and key tensors.
+    """
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    
+    # Reshape to match the complex dimension
+    freqs_cis = freqs_cis[:xq.shape[1]]
+    
+    # Apply rotary embeddings
+    xq_out = torch.view_as_real(xq_ * freqs_cis.unsqueeze(0).unsqueeze(2)).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis.unsqueeze(0).unsqueeze(2)).flatten(3)
+    
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
-def precompute_freqs_cis(
-    dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False
-):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
-    if use_scaled:
-        freqs = apply_scaling(freqs)
-    freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
+# ---------------------------------------------------------------------------
+# Model implementation
 
-# -----------------------------------------------------------------------------
-# LLaMA building blocks
-
-# LLaMA reference code explicitly implemented RMSNorm so we copy pasted it
-# (https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/api/model.py)
-# we could also use nn.RMSNorm, it has slightly different numeric properties, but equivalent
-class RMSNorm(torch.nn.Module):
+class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_dtype = x.dtype
+        x = x.float()  # Ensure computation in float32
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        return (self.weight * x).to(x_dtype)
 
-    def forward(self, x):
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
-
-class CausalSelfAttention(nn.Module):
-
-    def __init__(self, config):
+class Attention(nn.Module):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
-        assert config.n_embd % config.n_head == 0
-
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.n_rep = self.n_head // self.n_kv_head
-        self.hd = config.n_embd // config.n_head
-        self.use_kv = config.use_kv
-        self.flash = config.flash
-
-        self.c_attn = nn.Linear(config.n_embd, (config.n_head + 2 * config.n_kv_head) * self.hd, bias=False)  # key, query, value projections
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)  # output projection
-
-        # static KV cache - we could alternatively allocate it outside of the model and just pass it in when needed
-        if self.use_kv:
-            self.cache_k = torch.zeros((config.max_gen_batch_size, config.block_size, config.n_kv_head, self.hd))
-            self.cache_v = torch.zeros((config.max_gen_batch_size, config.block_size, config.n_kv_head, self.hd))
-
-    def forward(self, x, freqs_cis=None, start_pos=None, mask=None):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split([self.n_head * self.hd, self.n_kv_head * self.hd, self.n_kv_head * self.hd], dim=-1)
-        q, k, v = map(lambda t: t.view(B, T, -1, self.hd), (q, k, v))  # (B, T, NH, HD)
-
-        q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)  # rotate QK (rope)  <-- 1. difference compared to GPT-2
-
-        if self.use_kv and not self.training and start_pos >= 0:  # use kv-caching during inference
-            self.cache_k[:B, start_pos : start_pos + T] = k
-            self.cache_v[:B, start_pos : start_pos + T] = v
-            k = self.cache_k[:B, : start_pos + T]
-            v = self.cache_v[:B, : start_pos + T]
-
-        k = repeat_kv(k, self.n_rep)  # GQA <-- 2. difference compared to GPT-2
-        v = repeat_kv(v, self.n_rep)
-
-        q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # (B, NH, T, HD)
-
+        self.n_heads = config.n_heads
+        self.n_kv_heads = config.n_kv_heads
+        self.dim = config.dim
+        self.head_dim = config.dim // config.n_heads
+        
+        # For GQA: n_kv_heads can be less than n_heads
+        self.n_rep = self.n_heads // self.n_kv_heads
+        
+        # Projection matrices
+        self.wq = nn.Linear(config.dim, config.n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(config.dim, config.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(config.dim, config.n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(config.n_heads * self.head_dim, config.dim, bias=False)
+        
+        # Set output projection scale flag for residual scaling
+        self.wo.LLMC_RESIDUAL_SCALE_FLAG = 1
+        
+        # Initialize flash attention if available
+        self.flash = hasattr(F, "scaled_dot_product_attention")
+    
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+        
+        # Project to queries, keys, values
+        xq = self.wq(x).view(batch_size, seq_len, self.n_heads, self.head_dim)
+        xk = self.wk(x).view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
+        xv = self.wv(x).view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
+        
+        # Apply rotary embeddings
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
+        
+        # Repeat keys and values for GQA if necessary
+        if self.n_rep > 1:
+            xk = repeat_kv(xk, self.n_rep)
+            xv = repeat_kv(xv, self.n_rep)
+            
+        # Reshape for attention computation
+        xq = xq.transpose(1, 2)  # (batch_size, n_heads, seq_len, head_dim)
+        xk = xk.transpose(1, 2)
+        xv = xv.transpose(1, 2)
+        
+        # Compute attention
         if self.flash:
-            # flashattention
-            # if T == 1 no need to mask, otherwise the function complains
-            # scaled_dot_product_attention expects a mask where value of True indicates that the element should take part in attention
-            # our mask is the opposite, so we need to invert it
-            y = F.scaled_dot_product_attention(q, k, v, mask == 0 if T > 1 else None)
+            # Use flash attention if available
+            output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True)
         else:
-            # manual implementation of attention
-            # this materializes the large (T,T) matrix for all the queries and keys
-            scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.hd))
-            if mask is not None:
-                scores.masked_fill_(mask, torch.finfo(scores.dtype).min)
-            att = F.softmax(scores.float(), dim=-1).type_as(q)
-            y = att @ v # (B, NH, T, T) x (B, NH, T, HD) -> (B, NH, T, HD)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.c_proj(y)
-        return y
+            # Manual implementation of attention
+            scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
+            causal_mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device), diagonal=1)
+            scores = scores.masked_fill(causal_mask, -float('inf'))
+            attention = F.softmax(scores, dim=-1)
+            output = torch.matmul(attention, xv)
+        
+        # Reshape and project output
+        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        return self.wo(output)
 
-class MLP(nn.Module):
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Repeat keys/values for GQA."""
+    batch_size, seq_len, n_kv_heads, head_dim = x.shape
+    return (
+        x[:, :, :, None, :]
+        .expand(batch_size, seq_len, n_kv_heads, n_rep, head_dim)
+        .reshape(batch_size, seq_len, n_kv_heads * n_rep, head_dim)
+    )
 
-    def __init__(self, config):
+class FeedForward(nn.Module):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
-        hidden_dim = 4 * config.n_embd
-        hidden_dim = int(2 * hidden_dim / 3)
-        # custom dim factor multiplier
-        if config.ffn_dim_multiplier is not None:
-            hidden_dim = int(config.ffn_dim_multiplier * hidden_dim)
-        hidden_dim = config.multiple_of * ((hidden_dim + config.multiple_of - 1) // config.multiple_of)
-        self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
-        self.c_fc2 = nn.Linear(config.n_embd, hidden_dim, bias=False)
-        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        dim = config.dim
+        hidden_dim = config.hidden_dim
+        
+        # SwiGLU activation
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+        
+        # Set output projection scale flag for residual scaling
+        self.w2.LLMC_RESIDUAL_SCALE_FLAG = 1
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # SwiGLU activation function
+        swish = F.silu(self.w1(x))
+        x_V = self.w3(x)
+        x = swish * x_V
+        return self.w2(x)
 
-    def forward(self, x):
-        # SwiGLU self.c_proj(F.silu(self.c_fc2(x)) * self.c_fc(x))  <-- 3. difference compared to GPT-2
-        x1 = self.c_fc(x)
-        x2 = self.c_fc2(x)
-        x2 = F.silu(x2)
-        x = x1 * x2
-        x = self.c_proj(x)
-        return x
-
-class Block(nn.Module):
-
-    def __init__(self, config):
+class LlamaBlock(nn.Module):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
-        self.ln_1 = RMSNorm(config.n_embd, config.norm_eps)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = RMSNorm(config.n_embd, config.norm_eps)
-        self.mlp = MLP(config)
+        self.attention = Attention(config)
+        self.feed_forward = FeedForward(config)
+        self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps)
+        self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps)
+    
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+        # Pre-normalization for attention
+        h = x + self.attention(self.attention_norm(x), freqs_cis)
+        # Pre-normalization for feed-forward
+        out = h + self.feed_forward(self.ffn_norm(h))
+        return out
 
-    def forward(self, x, freqs_cis=None, start_pos=None, mask=None):
-        x = x + self.attn(self.ln_1(x), freqs_cis, start_pos, mask)
-        x = x + self.mlp(self.ln_2(x))
-        return x
-
-# -----------------------------------------------------------------------------
-# The main LLaMA 3.1 model
-
-@dataclass
-class LlamaConfig:
-    version: str = "3.1"
-    block_size: int = 8192
-    vocab_size: int = 128256
-    n_layer: int = 32
-    n_head: int = 32
-    n_kv_head: int = 8
-    n_embd: int = 4096
-    ffn_dim_multiplier: float = 1.3
-    multiple_of: int = 1024
-    norm_eps: float = 1e-5
-    rope_theta: float = 500000.0
-    use_scaled_rope: bool = True
-    max_gen_batch_size: int = 4
-    use_kv: bool = True
-    flash: bool = False  # use flashattention?
-
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            if hasattr(self, k):
-                setattr(self, k, v)
-        assert self.n_kv_head <= self.n_head
-        assert self.n_head % self.n_kv_head == 0
-        assert self.n_embd % self.n_head == 0
-
-class LLaMA(nn.Module):
-
-    def __init__(self, config):
+class LlamaModel(nn.Module):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
         self.config = config
-
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = RMSNorm(config.n_embd, config.norm_eps),
-        ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
-        # init all weights, use a torch rng object to be very careful
-        self.init_rng = torch.Generator()
-        self.init_rng.manual_seed(42)
-
+        
+        self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
+        self.layers = nn.ModuleList([LlamaBlock(config) for _ in range(config.n_layers)])
+        self.norm = RMSNorm(config.dim, eps=config.norm_eps)
+        
+        # Pre-compute RoPE frequencies
         self.freqs_cis = precompute_freqs_cis(
-            config.n_embd // config.n_head,
-            config.block_size * 2,
-            config.rope_theta,
-            config.use_scaled_rope,
+            config.dim // config.n_heads,
+            config.max_seq_len * 2,
+            config.rope_base,
         )
+    
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len = tokens.shape
+        h = self.tok_embeddings(tokens)
+        
+        # Retrieve the RoPE frequencies for the current sequence length
+        freqs_cis = self.freqs_cis[:seq_len].to(h.device)
+        
+        # Apply transformer layers
+        for layer in self.layers:
+            h = layer(h, freqs_cis)
+        
+        h = self.norm(h)
+        return h
 
-    def forward(self, idx, targets=None, return_logits=True, start_pos=0):
-        _, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+class LlamaForCausalLM(nn.Module):
+    def __init__(self, config: LlamaConfig):
+        super().__init__()
+        self.model = LlamaModel(config)
+        self.lm_head = nn.Linear(config.dim, config.vocab_size, bias=False)
+        
+        # Tie weights between token embeddings and LM head
+        self.lm_head.weight = self.model.tok_embeddings.weight
+        
+        # Initialize weights
+        self.apply(self._init_weights)
+        
+        # Special scaling for output projection layers
+        for name, module in self.named_modules():
+            if hasattr(module, "LLMC_RESIDUAL_SCALE_FLAG"):
+                module.weight.data *= (1.0 / math.sqrt(2 * config.n_layers))
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            std = 0.02
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+    
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        h = self.model(tokens)
+        logits = self.lm_head(h)
+        return logits
 
-        # forward the LLaMA model itself
-        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        freqs_cis = self.freqs_cis[start_pos:start_pos+t]
+# ---------------------------------------------------------------------------
+# Data loading and tokenization functions similar to train_gpt2.py
+# (These would need to be implemented based on the existing dataloader in llm.c)
 
-        mask = torch.triu(torch.ones((t, t), device=next(self.parameters()).device, dtype=torch.bool), diagonal=1)
+# ---------------------------------------------------------------------------
+# Training functions
 
-        for i, block in enumerate(self.transformer.h):
-            x = block(x, freqs_cis, start_pos, mask)
-        x = self.transformer.ln_f(x)
+def train_llama3(config_name: str = "llama3-tiny"):
+    """
+    Main training function for LLaMA3 models.
+    """
+    # Create configuration
+    config = LlamaConfig.from_name(config_name)
+    
+    # Initialize model
+    model = LlamaForCausalLM(config)
+    
+    # Training code would follow here - similar to train_gpt2.py
+    # This would include data loading, optimizer setup, training loop, etc.
+    
+    # Save model weights in a format compatible with llm.c
+    # This would involve exporting the weights similarly to how it's done in train_gpt2.py
+    
+    # Save the model in the appropriate format for C
+    export_model_for_c(model, config)
 
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x).float()
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]).float() # note: using list [-1] to preserve the time dim
-            loss = None
+def export_model_for_c(model, config):
+    """
+    Export model weights to binary files for C consumption.
+    Similar to how it's done in train_gpt2.py
+    """
+    print("Exporting model weights for C...")
+    # Implementation would extract weights and save them in the format
+    # expected by the C code in llm.c
+    
+    # This would follow a similar pattern to what's in train_gpt2.py
 
-        # there are performance reasons why not returning logits is prudent, if not needed
-        if not return_logits:
-            logits = None
-
-        return logits, loss
-
-    @staticmethod
-    def adapt_llama_state_dict_keys(checkpoint, config: LlamaConfig):
-        # Modify key names from Meta's LLaMA to our LLaMA
-        # our key names are derived from GPT-2's key names
-        checkpoint['transformer.wte.weight'] = checkpoint.pop('tok_embeddings.weight')
-
-        for i in range(config.n_layer):
-            for name in ['attention_norm', 'ffn_norm']:
-                old_key = f'layers.{i}.{name}.weight'  # e.g. layers.x.attention_norm.weight -> transformer.h.x.ln_1.weight
-                new_key = f'transformer.h.{i}.ln_{1 if name == "attention_norm" else 2}.weight'
-                checkpoint[new_key] = checkpoint.pop(old_key)
-
-        for i in range(config.n_layer):
-            for name in ['attention.wq', 'attention.wk', 'attention.wv']:
-                old_key = f'layers.{i}.{name}.weight'
-                new_key = f'transformer.h.{i}.attn.c_attn.weight'
-                if name == 'attention.wq':
-                    checkpoint[new_key] = checkpoint.pop(old_key)
-                else:  # merge 3 weights into transformer.h.x.attn.c_attn.weight
-                    checkpoint[new_key] = torch.cat((checkpoint[new_key], checkpoint.pop(old_key)), dim=0)
-            old_key = f'layers.{i}.attention.wo.weight'
-            new_key = f'transformer.h.{i}.attn.c_proj.weight'
-            checkpoint[new_key] = checkpoint.pop(old_key)
-
-        ffn_map = {'w1': 'c_fc2', 'w2': 'c_proj', 'w3': 'c_fc'}
-        for i in range(config.n_layer):
+if __name__ == "__main__":
+    train_llama3()
             for name in ['feed_forward.w1', 'feed_forward.w2', 'feed_forward.w3']:
                 old_key = f'layers.{i}.{name}.weight'
                 new_key = f'transformer.h.{i}.mlp.{ffn_map[name.split(".")[-1]]}.weight'
