@@ -37,10 +37,16 @@ import torch.distributed as dist
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
-class NewGELU(nn.Module):
-    """Careful there are a few versions of GeLU, this one is the exact one used by OpenAI"""
-    def forward(self, input):
-        return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
+class SwiGLU(nn.Module):
+    """
+    SwiGLU Activation function used in LLaMA models
+    Ref: https://arxiv.org/abs/2002.05202
+    """
+    def forward(self, x):
+        dim = x.shape[-1]
+        half_dim = dim // 2
+        a, b = x.split(half_dim, dim=-1)
+        return a * F.silu(b)
 
 # using a global to toggle flash-attention
 FLASH = 0
@@ -89,15 +95,22 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.gelu    = NewGELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
-        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
+        # Change the MLP architecture to use SwiGLU instead of GELU
+        hidden_dim = 4 * config.n_embd // 3  # Adjust hidden dimension to maintain parameter count
+        self.gate_proj = nn.Linear(config.n_embd, hidden_dim, bias=False)
+        self.up_proj = nn.Linear(config.n_embd, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        self.swiglu = SwiGLU()
+        self.down_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
+        # SwiGLU forward pass
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        # Concatenate for the SwiGLU layer
+        x = torch.cat([gate, up], dim=-1)
+        x = self.swiglu(x)
+        x = self.down_proj(x)
         return x
 
 class Block(nn.Module):
@@ -414,14 +427,15 @@ def write_tensors(model_tensors, L, file, dtype):
         write_fun(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
     for i in range(L): # (L, C)
         write_fun(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
-    for i in range(L): # (L, 4C, C)
-        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
-    for i in range(L): # (L, 4C)
-        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc.bias"], file)
-    for i in range(L): # (L, C, 4C)
-        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
-    for i in range(L): # (L, C)
-        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
+    
+    # Update for SwiGLU - change how we write MLP weights
+    for i in range(L): # (L, hidden_dim, C)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.gate_proj.weight"], file)
+    for i in range(L): # (L, hidden_dim, C)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.up_proj.weight"], file)
+    for i in range(L): # (L, C, hidden_dim)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.down_proj.weight"], file)
+    
     write_fun(model_tensors["transformer.ln_f.weight"], file) # (C, )
     write_fun(model_tensors["transformer.ln_f.bias"], file) # (C, )
 
@@ -482,13 +496,13 @@ def write_state(model, x, y, logits, loss, filename):
     # this can be used for checking the computation correctness in C
     header = torch.zeros(256, dtype=torch.int32)
     header[0] = 20240327 # magic
-    header[1] = 2 # run state version = 2 (1 -> 2 for padded vocab changes)
+    header[1] = 3 # run state version = 3 (1 -> 2 for padded vocab changes, 2 -> 3 for SwiGLU)
     header[2] = x.size(0) # batch size of the batch, B
     header[3] = x.size(1) # temporal extent of the batch, T
     grads = {name: param.grad.cpu() for name, param in model.named_parameters()}
     # pad the vocab grads here as well, to mirror write_model
     wte_grad = grads["transformer.wte.weight"] # (V, C)
-    wte_grad_padded = pad_vocab(wte_grad, value=0) # (Vp, C) # TODO later maybe pad with nan?
+    wte_grad_padded = pad_vocab(wte_grad, value=0) # (Vp, C)
     grads["transformer.wte.weight"] = wte_grad_padded # (Vp, C)
     print(f"padded vocab size in reference grads from {wte_grad.size(0)} to {wte_grad_padded.size(0)}")
     with open(filename, "wb") as file:
@@ -736,12 +750,6 @@ if __name__ == "__main__":
         with open(logfile, "w") as f:
             pass
 
-    # create directory for saving models
-    saved_models_dir = "/content/saved_models"
-    if master_process:
-        os.makedirs(saved_models_dir, exist_ok=True)
-        print0(f"Models will be saved to {saved_models_dir}")
-
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     timings = []
@@ -851,44 +859,14 @@ if __name__ == "__main__":
             with open(logfile, "a") as f:
                 f.write("s:%d trl:%f\n" % (step, lossf))
 
-        # Save model every 5 epochs/steps (excluding step 0)
-        if master_process and step > 0 and step % 5 == 0:
-            model_to_size = {"gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
-            model_to_size.update({f"d{d}": f"d{d}" for d in [12, 24, 36, 48]})
-            model_size_str = model_to_size[args.model]
-            model_save_path = os.path.join(saved_models_dir, f"gpt2_{model_size_str}_step{step}.bin")
-            write_model(raw_model, model_save_path, dtype=args.dtype)
-            print0(f"Saved model at step {step} to {model_save_path}")
+        # keep track of smooth timings, last 20 iterations
+        if step > 0 and step > args.num_iterations - 20:
+            timings.append(t1-t0)
 
     # print the average of the last 20 timings, to get something smooth-ish
     timings = timings[-20:]
     print0(f"final {len(timings)} iters avg: {np.mean(timings)*1000:.3f}ms")
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
-
-    # -------------------------------------------------------------------------
-    # Save the model from the last epoch/step always
-    if master_process:
-        model_to_size = {"gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
-        model_to_size.update({f"d{d}": f"d{d}" for d in [12, 24, 36, 48]})
-        model_size_str = model_to_size[args.model]
-        # Save in .bin format for C
-        final_model_save_path = os.path.join(saved_models_dir, f"gpt2_{model_size_str}_final.bin")
-        write_model(raw_model, final_model_save_path, dtype=args.dtype)
-        print0(f"Saved final model to {final_model_save_path}")
-        
-        # Save in PyTorch .pt format for Python evaluation
-        pt_save_path = os.path.join(saved_models_dir, f"gpt2_{model_size_str}_final.pt")
-        torch.save(raw_model.state_dict(), pt_save_path)
-        print0(f"Saved PyTorch model to {pt_save_path}")
-
-        # Also save the periodic checkpoints in .pt format
-        for checkpoint_file in glob.glob(os.path.join(saved_models_dir, f"gpt2_{model_size_str}_step*.bin")):
-            step_num = checkpoint_file.split("step")[-1].split(".bin")[0]
-            pt_checkpoint_path = os.path.join(saved_models_dir, f"gpt2_{model_size_str}_step{step_num}.pt")
-            if not os.path.exists(pt_checkpoint_path):
-                # Only create .pt if it doesn't already exist (in case this is rerun)
-                torch.save(raw_model.state_dict(), pt_checkpoint_path)
-                print0(f"Saved checkpoint PyTorch model to {pt_checkpoint_path}")
 
     # -------------------------------------------------------------------------
     # clean up nice
